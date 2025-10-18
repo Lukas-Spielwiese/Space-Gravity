@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#0f3460" />
+  <title>Space Gravity – Supabase Edition</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #000; color: #fff; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; overflow: hidden; }
+    canvas { display: block; width: 100vw; height: 100vh; touch-action: none; }
+    #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0, 0, 0, 0.85); display: flex; flex-direction: column; align-items: center;
+      justify-content: center; text-align: center; padding: 20px; }
+    .btn { background: #1a1a2e; color: #fff; padding: 12px 24px; margin: 8px;
+      border: none; border-radius: 6px; cursor: pointer; font-size: 1rem; transition: background 0.15s; }
+    .btn:hover { background: #0f3460; }
+    .modal { background: #0f0e17; padding: 20px; border-radius: 8px; max-width: 90%; margin: 12px; }
+    table { width: 100%; border-collapse: collapse; color: #fff; }
+    th, td { padding: 6px 8px; border-bottom: 1px solid #333; }
+    th { background: #1f2937; }
+    input, select { padding: 8px; margin: 6px; border: none; border-radius: 4px; }
+    .scoreboard { max-height: 300px; overflow-y: auto; margin-top: 10px; width: 100%; text-align: left; }
+    .tab-buttons { margin-bottom: 10px; }
+    .tab-buttons .tab-btn { background: #1a1a2e; margin: 4px; padding: 8px 12px; border-radius: 4px; cursor: pointer; }
+    .tab-btn.active { background: #0f3460; }
+    #cta a { color: #0bc9c8; text-decoration: none; }
+  </style>
+  <!-- Supabase client library removed (we use REST API directly) -->
+</head>
+<body>
+  <div id="overlay"></div>
+  <canvas id="gameCanvas"></canvas>
+  <script>
+    (function() {
+      const canvas = document.getElementById('gameCanvas');
+      const ctx = canvas.getContext('2d');
+      let width, height;
+      // Game state variables
+      let running = false;
+      let paused = false;
+      let mode = 'classic';
+      const pointer = { x: 0, y: 0 };
+      let items = [];
+      let spawnTimer = 0;
+      let lastTime = 0;
+      let score = 0;
+      let lives = 3;
+      let level = 1;
+      let wave = 1;
+      let waveTimer = 0;
+      let waveDuration = 12; // shorter waves for more action
+      let spawnMultiplier = 1;
+      let startTime = 0;
+      let duration = 60;
+      let density = 'normal';
+      let playerIndex = 0;
+      let players = [];
+      const notifications = [];
+      let magnetTime = 0;
+      let shieldActive = false;
+      const dailySeed = getDailySeed();
+
+      // Power-up timers
+      let slowTimeLeft = 0; // slows item movement when >0
+      let radiusBoostLeft = 0; // enlarges gravitation radius when >0
+
+      // Global tempo scaler (can be adjusted via slider)
+      window.SPEED_SCALE = 0.65; // fixed tempo ~65%
+
+      // Supabase configuration – provided values
+      const supabaseUrl = 'https://llkhfcyyajyhgsqucpu.supabase.co';
+      const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imxsa2ZoZmN5eWFqeWhnc3F1Y3B1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA2Mzg0ODcsImV4cCI6MjA3NjIxNDQ4N30.1l4BW1mqWBF0Go44m7w3RvRZLiAO8gz-Xm1iFocM-HQ';
+      const supabaseEndpoint = supabaseUrl + '/rest/v1/leaderboard';
+
+      function resize() {
+        width = window.innerWidth;
+        height = window.innerHeight;
+        canvas.width = width;
+        canvas.height = height;
+      }
+      window.addEventListener('resize', resize);
+      resize();
+
+      function updatePointer(e) {
+        const rect = canvas.getBoundingClientRect();
+        pointer.x = e.clientX - rect.left;
+        pointer.y = e.clientY - rect.top;
+      }
+      canvas.addEventListener('mousemove', updatePointer);
+      canvas.addEventListener('touchmove', e => {
+        if (e.touches.length > 0) updatePointer(e.touches[0]);
+      }, { passive: true });
+
+      window.addEventListener('keydown', e => {
+        if (e.key === 'p' || e.key === 'P') {
+          paused = !paused;
+        } else if (e.key === 'r' || e.key === 'R') {
+          restart();
+        }
+      });
+
+      // Social share helpers
+      const SHARE_BASE_URL = 'https://space-gravity-two.vercel.app';
+      function shareText(entry) {
+        const modeLabel = mode === 'classic' ? 'Classic' : (mode === 'passplay' ? 'Pass & Play' : 'Daily');
+        return `Mein Highscore in „Space Gravity“: ${entry.score} Punkte (Welle ${entry.wave}, Modus ${modeLabel}).`;
+      }
+      function shareToTwitter(entry) {
+        const url = 'https://twitter.com/intent/tweet?text=' + encodeURIComponent(shareText(entry)) + '&url=' + encodeURIComponent(SHARE_BASE_URL);
+        window.open(url, '_blank');
+      }
+      function shareToFacebook(entry) {
+        const url = 'https://www.facebook.com/sharer/sharer.php?u=' + encodeURIComponent(SHARE_BASE_URL) + '&quote=' + encodeURIComponent(shareText(entry));
+        window.open(url, '_blank');
+      }
+      function shareToLinkedIn(entry) {
+        window.open('https://www.linkedin.com/sharing/share-offsite/?url=' + encodeURIComponent(SHARE_BASE_URL), '_blank');
+      }
+      function shareToMastodon(entry) {
+        const url = 'https://mastodon.social/share?text=' + encodeURIComponent(shareText(entry) + ' ' + SHARE_BASE_URL);
+        window.open(url, '_blank');
+      }
+      function shareToWhatsApp(entry) {
+        const url = 'https://api.whatsapp.com/send?text=' + encodeURIComponent(shareText(entry) + ' ' + SHARE_BASE_URL);
+        window.open(url, '_blank');
+      }
+      async function shareNative(entry) {
+        if (navigator.share) {
+          try {
+            await navigator.share({ title: 'Space Gravity', text: shareText(entry), url: SHARE_BASE_URL });
+          } catch (_) {
+            /* ignore */
+          }
+        } else {
+          addNotification('Native Share nicht unterstützt');
+        }
+      }
+      async function copyShareLink() {
+        try {
+          await navigator.clipboard.writeText(SHARE_BASE_URL);
+          addNotification('Link kopiert!');
+        } catch (_) {
+          addNotification('Kopieren fehlgeschlagen');
+        }
+      }
+
+      // Scoreboard using localStorage fallback
+      function getScoreboard() {
+        try {
+          const sb = localStorage.getItem('spaceScoreboard');
+          return sb ? JSON.parse(sb) : { classic: [], passplay: [], daily: [] };
+        } catch (_) {
+          return { classic: [], passplay: [], daily: [] };
+        }
+      }
+      function saveScoreboard(data) {
+        try {
+          localStorage.setItem('spaceScoreboard', JSON.stringify(data));
+        } catch (_) {
+          /* ignore */
+        }
+      }
+
+      // Insert a leaderboard entry into Supabase
+      async function insertScoreToSupabase(entry) {
+        try {
+          await fetch(supabaseEndpoint, {
+            method: 'POST',
+            headers: {
+              'apikey': supabaseKey,
+              'Authorization': 'Bearer ' + supabaseKey,
+              'Content-Type': 'application/json',
+              'Prefer': 'return=representation'
+            },
+            body: JSON.stringify(entry)
+          });
+        } catch (err) {
+          console.warn('Supabase insert error', err);
+        }
+      }
+
+      // Fetch top leaderboard entries from Supabase for a given mode
+      async function fetchScores(mode) {
+        try {
+          const url = new URL(supabaseEndpoint);
+          url.searchParams.set('select', '*');
+          url.searchParams.set('mode', `eq.${mode}`);
+          url.searchParams.set('order', 'score.desc');
+          url.searchParams.set('limit', '10');
+          const res = await fetch(url.toString(), {
+            headers: {
+              'apikey': supabaseKey,
+              'Authorization': 'Bearer ' + supabaseKey
+            }
+          });
+          if (!res.ok) {
+            console.warn('Supabase fetch error', res.statusText);
+            return [];
+          }
+          const data = await res.json();
+          return data;
+        } catch (err) {
+          console.error('Supabase fetch exception', err);
+          return [];
+        }
+      }
+
+      function spawnItem() {
+        // Weighted random types
+        const types = [
+          { type: 'blue',   weight: 55 },
+          { type: 'red',    weight: 30 },
+          { type: 'gold',   weight: 8 },
+          { type: 'green',  weight: 6 },
+          { type: 'purple', weight: 3 },
+          { type: 'gray',   weight: 4 },
+          { type: 'teal',   weight: 2 },
+          { type: 'orange', weight: 2 },
+        ];
+        let total = 0;
+        types.forEach(t => total += t.weight);
+        let r = Math.random() * total;
+        let chosen = 'blue';
+        for (const t of types) {
+          if (r < t.weight) { chosen = t.type; break; }
+          r -= t.weight;
+        }
+        const angle = Math.random() * Math.PI * 2;
+        const base=4.0; const rand=7.0; const perWave=1.6; const speedScale = (window.SPEED_SCALE ?? 0.65);
+        const speed = (base + Math.random()*rand + wave*perWave) * speedScale;
+        const startRadius = Math.max(width, height) / 2 + 100;
+        const cx = width / 2;
+        const cy = height / 2;
+        const x = cx + Math.cos(angle) * startRadius;
+        const y = cy + Math.sin(angle) * startRadius;
+        const vx = -Math.cos(angle) * speed;
+        const vy = -Math.sin(angle) * speed;
+        let color, life = 26 + Math.random() * 14, size = 6 + Math.random() * 4 + level;
+        switch (chosen) {
+          case 'blue': color = '#60a5fa'; break;
+          case 'red': color = '#f87171'; break;
+          case 'gold': color = '#fcd34d'; break;
+          case 'green': color = '#22c55e'; break;
+          case 'purple': color = '#c084fc'; break;
+          case 'gray': color = '#a1a1aa'; break;
+          case 'teal': color = '#2dd4bf'; break;
+          case 'orange': color = '#fb923c'; break;
+        }
+        items.push({ type: chosen, x, y, vx, vy, life, size, color });
+      }
+
+      function update(dt) {
+        if (slowTimeLeft > 0) slowTimeLeft = Math.max(0, slowTimeLeft - dt);
+        if (radiusBoostLeft > 0) radiusBoostLeft = Math.max(0, radiusBoostLeft - dt);
+        const dtMult = slowTimeLeft > 0 ? 0.6 : 1.0;
+
+        spawnTimer -= dt;
+        let baseInterval = density === 'normal' ? 0.32 : density === 'hoch' ? 0.24 : 0.18;
+        const effective = baseInterval / spawnMultiplier;
+        while (spawnTimer < 0) {
+          spawnItem();
+          spawnTimer += effective;
+        }
+
+        for (let i = items.length - 1; i >= 0; i--) {
+          const item = items[i];
+          const dx = pointer.x - item.x;
+          const dy = pointer.y - item.y;
+          const distSq = dx * dx + dy * dy;
+
+          const ringR = radiusBoostLeft > 0 ? 120 : 80;
+          const d = Math.sqrt(distSq);
+          const soft = 25000;
+          const baseG = magnetTime > 0 ? 180000 : 110000;
+          const sigma = ringR * 0.25;
+          const peak = Math.exp(-((d - ringR)*(d - ringR)) / (2*sigma*sigma));
+          const gravConst = baseG * (0.12 + 0.88 * peak);
+          const force = gravConst / (distSq + soft);
+          item.vx += force * dx * dt * dtMult;
+          item.vy += force * dy * dt * dtMult;
+
+          item.x += item.vx * dt * dtMult;
+          item.y += item.vy * dt * dtMult;
+          item.life -= dt * dtMult;
+
+          const dragPerSecond = 0.84;
+          const drag = Math.pow(dragPerSecond, dt * dtMult);
+          item.vx *= drag; item.vy *= drag;
+          const vmax = 420 * (window.SPEED_SCALE ?? 0.75);
+          const vcur = Math.hypot(item.vx, item.vy);
+          if (vcur > vmax) { const s = vmax / vcur; item.vx *= s; item.vy *= s; }
+
+          const pr = radiusBoostLeft > 0 ? 25 : 20;
+          if (dx * dx + dy * dy < pr * pr) {
+            handleTouch(item);
+            items.splice(i, 1);
+            continue;
+          }
+          if (item.life <= 0 || item.x < -200 || item.x > width + 200 || item.y < -200 || item.y > height + 200) {
+            items.splice(i, 1);
+          }
+        }
+
+        if (magnetTime > 0) magnetTime = Math.max(0, magnetTime - dt);
+
+        for (let i = notifications.length - 1; i >= 0; i--) {
+          notifications[i].time -= dt;
+          if (notifications[i].time <= 0) notifications.splice(i, 1);
+        }
+
+        waveTimer -= dt;
+        if (waveTimer <= 0) {
+          wave++;
+          waveTimer += waveDuration;
+          spawnMultiplier *= 1.12;
+          if (wave % 3 === 0) {
+            lives = Math.min(lives + 1, 5);
+            addNotification('Bonusleben!');
+          }
+          addNotification('Welle ' + wave);
+        }
+
+        const elapsed = (performance.now() - startTime) / 1000;
+        if (elapsed >= duration) {
+          endRound();
+        }
+      }
+
+      function handleTouch(item) {
+        if (item.type === 'blue') {
+          score += 1;
+        } else if (item.type === 'red') {
+          if (shieldActive) {
+            shieldActive = false;
+            addNotification('Schild benutzt!');
+          } else {
+            lives--;
+            if (lives <= 0) {
+              endRound();
+            }
+          }
+        } else if (item.type === 'gold') {
+          score += 5;
+        } else if (item.type === 'green') {
+          lives = Math.min(lives + 1, 5);
+        } else if (item.type === 'purple') {
+          magnetTime = 8;
+          addNotification('Magnet aktiv!');
+        } else if (item.type === 'gray') {
+          shieldActive = true;
+          addNotification('Schild erhalten!');
+        } else if (item.type === 'teal') {
+          slowTimeLeft = 6;
+          addNotification('Zeitlupe!');
+        } else if (item.type === 'orange') {
+          radiusBoostLeft = 6;
+          addNotification('Radius-Boost!');
+        }
+      }
+
+      function draw() {
+        ctx.clearRect(0, 0, width, height);
+        ctx.fillStyle = 'rgba(0,0,20,1)';
+        ctx.fillRect(0, 0, width, height);
+        items.forEach(item => {
+          ctx.fillStyle = item.color;
+          ctx.beginPath();
+          ctx.arc(item.x, item.y, item.size, 0, Math.PI * 2);
+          ctx.fill();
+        });
+        const ringR = radiusBoostLeft > 0 ? 120 : 80;
+        ctx.strokeStyle = 'rgba(100,150,255,0.6)';
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.arc(pointer.x, pointer.y, ringR, 0, Math.PI * 2); ctx.stroke();
+        const prDraw = radiusBoostLeft > 0 ? 25 : 20;
+        ctx.strokeStyle = '#ffffff';
+        ctx.beginPath(); ctx.arc(pointer.x, pointer.y, prDraw, 0, Math.PI * 2); ctx.stroke();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '16px sans-serif';
+        ctx.fillText('Punkte: ' + score, 10, 20);
+        ctx.fillText('Leben: ' + lives, 10, 40);
+        ctx.fillText('Welle: ' + wave, 10, 60);
+        const timeLeft = Math.max(0, Math.ceil(duration - (performance.now() - startTime) / 1000));
+        ctx.fillText('Zeit: ' + timeLeft + 's', 10, 80);
+
+        let statusY = 100;
+        if (shieldActive) { ctx.fillText('Schild aktiv', 10, statusY); statusY += 20; }
+        if (magnetTime > 0) { ctx.fillText('Magnet: ' + Math.ceil(magnetTime) + 's', 10, statusY); statusY += 20; }
+        if (slowTimeLeft > 0) { ctx.fillText('Zeitlupe: ' + Math.ceil(slowTimeLeft) + 's', 10, statusY); statusY += 20; }
+        if (radiusBoostLeft > 0) { ctx.fillText('Boost: ' + Math.ceil(radiusBoostLeft) + 's', 10, statusY); statusY += 20; }
+
+        ctx.textAlign = 'center';
+        notifications.forEach((n, idx) => {
+          ctx.fillStyle = '#ffffff';
+          ctx.fillText(n.text, width / 2, 120 + idx * 20);
+        });
+        ctx.textAlign = 'left';
+      }
+
+      function endRound() {
+        running = false;
+        const entry = {
+          name: mode === 'passplay' ? players[playerIndex] : (prompt('Name/Initialen für die Bestenliste:', 'PLAYER')||'PLAYER').trim().substring(0, 12),
+          score,
+          wave,
+          duration,
+          date: new Date().toISOString().slice(0, 10),
+          mode: mode
+        };
+        let sb = getScoreboard();
+        sb[mode] = sb[mode] || [];
+        sb[mode].push(entry);
+        saveScoreboard(sb);
+        insertScoreToSupabase(entry);
+        showGameOver(entry);
+      }
+
+      function runGameLoop() {
+        running = true;
+        lastTime = performance.now();
+        function loop(now) {
+          if (!running) return;
+          const dt = (now - lastTime) / 1000;
+          lastTime = now;
+          if (!paused) update(dt);
+          draw();
+          requestAnimationFrame(loop);
+        }
+        requestAnimationFrame(loop);
+      }
+
+      function restart() {
+        running = false;
+        items = [];
+        score = 0;
+        lives = 3;
+        level = 1;
+        wave = 1;
+        waveDuration = Math.min(duration / 5, 10);
+        waveTimer = waveDuration;
+        spawnMultiplier = 1;
+        spawnTimer = 0;
+        startTime = performance.now();
+        magnetTime = 0;
+        shieldActive = false;
+        paused = false;
+        runGameLoop();
+      }
+
+      function addNotification(text) {
+        notifications.push({ text, time: 2 });
+      }
+
+      function getDailySeed() {
+        const today = new Date();
+        const str = today.toISOString().slice(0, 10);
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+          hash = ((hash << 5) - hash) + str.charCodeAt(i);
+          hash |= 0;
+        }
+        return Math.abs(hash);
+      }
+
+      function showMainMenu() {
+        const overlay = document.getElementById('overlay');
+        overlay.innerHTML = '';
+        const container = document.createElement('div');
+        container.className = 'modal';
+        const h1 = document.createElement('h1');
+        h1.textContent = 'Space Gravity';
+        container.appendChild(h1);
+        const modesDiv = document.createElement('div');
+        ['classic', 'passplay', 'daily'].forEach(m => {
+          const btn = document.createElement('button');
+          btn.className = 'btn';
+          btn.textContent = m === 'classic' ? 'Classic' : (m === 'passplay' ? 'Pass & Play' : 'Daily');
+          btn.onclick = () => showModeMenu(m);
+          modesDiv.appendChild(btn);
+        });
+        container.appendChild(modesDiv);
+        const scoreBtn = document.createElement('button');
+        scoreBtn.className = 'btn';
+        scoreBtn.textContent = 'Bestenliste';
+        scoreBtn.onclick = showScoreboardMenu;
+        container.appendChild(scoreBtn);
+        const legend = document.createElement('div');
+        legend.style.display = 'grid';
+        legend.style.gridTemplateColumns = 'repeat(auto-fit, minmax(150px, 1fr))';
+        legend.style.gap = '6px';
+        legend.style.justifyContent = 'center';
+        legend.style.marginTop = '14px';
+        const itemsInfo = [
+          { color: '#60a5fa', label: 'Blau: +1 Punkt' },
+          { color: '#f87171', label: 'Rot: −1 Leben' },
+          { color: '#fcd34d', label: 'Gold: +5 Punkte' },
+          { color: '#22c55e', label: 'Grün: +1 Leben' },
+          { color: '#c084fc', label: 'Lila: Magnet (8 s)' },
+          { color: '#a1a1aa', label: 'Grau: Schild' },
+          { color: '#2dd4bf', label: 'Türkis: Zeitlupe (6 s)' },
+          { color: '#fb923c', label: 'Orange: Radius-Boost (6 s)' }
+        ];
+        itemsInfo.forEach(it => {
+          const row = document.createElement('div');
+          row.style.display = 'flex';
+          row.style.alignItems = 'center';
+          const dot = document.createElement('span');
+          dot.style.display = 'inline-block';
+          dot.style.width = '12px';
+          dot.style.height = '12px';
+          dot.style.borderRadius = '50%';
+          dot.style.marginRight = '6px';
+          dot.style.background = it.color;
+          const text = document.createElement('span');
+          text.textContent = it.label;
+          row.appendChild(dot);
+          row.appendChild(text);
+          legend.appendChild(row);
+        });
+        container.appendChild(legend);
+        const cta = document.createElement('div');
+        cta.id = 'cta';
+        cta.innerHTML = 'Tritt unserem <a href="https://discord.gg/st" target="_blank" rel="noopener">Discord – Der Stammtisch</a> bei!';
+        container.appendChild(cta);
+        overlay.appendChild(container);
+        overlay.style.display = 'flex';
+      }
+
+      function showModeMenu(selected) {
+        mode = selected;
+        const overlay = document.getElementById('overlay');
+        overlay.innerHTML = '';
+        const container = document.createElement('div');
+        container.className = 'modal';
+        const h2 = document.createElement('h2');
+        h2.textContent = selected === 'classic' ? 'Classic Optionen' : (selected === 'passplay' ? 'Pass & Play Optionen' : 'Daily Challenge');
+        container.appendChild(h2);
+        if (selected === 'classic') {
+          const durLab = document.createElement('label'); durLab.textContent = 'Dauer: ';
+          const durSel = document.createElement('select'); [45,60,90].forEach(v => {
+            const opt = document.createElement('option'); opt.value = v; opt.textContent = v + 's'; durSel.appendChild(opt);
+          }); durSel.value = duration; durSel.onchange = () => { duration = parseInt(durSel.value); };
+          durLab.appendChild(durSel);
+          container.appendChild(durLab);
+          const densLab = document.createElement('label'); densLab.textContent = 'Dichte: ';
+          const densSel = document.createElement('select'); ['normal','hoch','sehr hoch'].forEach(v => {
+            const opt = document.createElement('option'); opt.value = v; opt.textContent = v; densSel.appendChild(opt);
+          }); densSel.value = density; densSel.onchange = () => { density = densSel.value; };
+          densLab.appendChild(densSel);
+          container.appendChild(densLab);
+          const startBtn = document.createElement('button'); startBtn.className = 'btn'; startBtn.textContent = 'Starten';
+          startBtn.onclick = () => { duration = parseInt(durSel.value); density = densSel.value; startGame(); };
+          container.appendChild(startBtn);
+        } else if (selected === 'passplay') {
+          const p1 = document.createElement('input'); p1.placeholder = 'Spieler 1';
+          const p2 = document.createElement('input'); p2.placeholder = 'Spieler 2';
+          container.appendChild(p1); container.appendChild(p2);
+          const durLab = document.createElement('label'); durLab.textContent = 'Dauer pro Spieler: ';
+          const durSel = document.createElement('select'); [45,60,90].forEach(v => {
+            const opt = document.createElement('option'); opt.value = v; opt.textContent = v + 's'; durSel.appendChild(opt);
+          }); durSel.value = duration; durSel.onchange = () => { duration = parseInt(durSel.value); };
+          durLab.appendChild(durSel); container.appendChild(durLab);
+          const startBtn = document.createElement('button'); startBtn.className = 'btn'; startBtn.textContent = 'Starten';
+          startBtn.onclick = () => {
+            if (!p1.value.trim() || !p2.value.trim()) { alert('Bitte beide Namen eingeben!'); return; }
+            players = [p1.value.trim().substring(0,12), p2.value.trim().substring(0,12)]; playerIndex = 0; startGame(); };
+          container.appendChild(startBtn);
+        } else if (selected === 'daily') {
+          const info1 = document.createElement('p'); info1.textContent = 'Datum: ' + new Date().toLocaleDateString('de-DE');
+          const info2 = document.createElement('p'); info2.textContent = 'Seed: ' + dailySeed;
+          container.appendChild(info1); container.appendChild(info2);
+          const startBtn = document.createElement('button'); startBtn.className = 'btn'; startBtn.textContent = 'Starten';
+          startBtn.onclick = () => { duration = 60; startGame(); };
+          container.appendChild(startBtn);
+        }
+        const backBtn = document.createElement('button'); backBtn.className = 'btn'; backBtn.textContent = 'Zurück'; backBtn.onclick = showMainMenu;
+        container.appendChild(backBtn);
+        overlay.appendChild(container);
+      }
+
+      function showScoreboardMenu() {
+        const overlay = document.getElementById('overlay');
+        overlay.innerHTML = '';
+        const container = document.createElement('div'); container.className = 'modal';
+        const h2 = document.createElement('h2'); h2.textContent = 'Bestenlisten';
+        container.appendChild(h2);
+        const tabDiv = document.createElement('div'); tabDiv.className = 'tab-buttons';
+        let activeTab = 'classic';
+        ['classic','passplay','daily'].forEach(m => {
+          const b = document.createElement('button'); b.className = 'tab-btn' + (m === activeTab ? ' active' : ''); b.textContent = m === 'classic' ? 'Classic' : (m === 'passplay' ? 'Pass & Play' : 'Daily');
+          b.onclick = () => { activeTab = m; Array.from(tabDiv.children).forEach(btn => btn.classList.remove('active')); b.classList.add('active'); renderTable(); };
+          tabDiv.appendChild(b);
+        });
+        container.appendChild(tabDiv);
+        const tableDiv = document.createElement('div'); tableDiv.className = 'scoreboard'; container.appendChild(tableDiv);
+        const shareBtn = document.createElement('button'); shareBtn.className = 'btn'; shareBtn.textContent = 'Kopieren'; shareBtn.onclick = () => {
+          const list = getList(activeTab);
+          const lines = list.map((e,i) => `${i+1}. ${e.name} - ${e.score} P (Welle ${e.wave}, Dauer ${e.duration}s)`);
+          const text = `Bestenliste ${activeTab}:
+` + (lines.join('\n') || '—');
+          navigator.clipboard.writeText(text).then(() => addNotification('Liste kopiert!'));
+        };
+        container.appendChild(shareBtn);
+        const backBtn = document.createElement('button'); backBtn.className = 'btn'; backBtn.textContent = 'Zurück'; backBtn.onclick = showMainMenu; container.appendChild(backBtn);
+        overlay.appendChild(container);
+        function getLocalList(m) {
+          let sb = getScoreboard();
+          let arr = sb[m] || [];
+          if (m === 'daily') {
+            const today = new Date().toISOString().slice(0,10);
+            arr = arr.filter(e => e.date === today);
+          }
+          return arr.sort((a,b) => b.score - a.score).slice(0, 10);
+        }
+        async function renderTable() {
+          tableDiv.innerHTML = '';
+          let list = [];
+          try {
+            list = await fetchScores(activeTab);
+          } catch(_) { list = []; }
+          if (!list || list.length === 0) {
+            list = getLocalList(activeTab);
+          }
+          const table = document.createElement('table');
+          const thead = document.createElement('thead');
+          const trh = document.createElement('tr');
+          ['Platz','Name','Punkte','Welle','Dauer','Datum'].forEach(h => { const th = document.createElement('th'); th.textContent = h; trh.appendChild(th); });
+          thead.appendChild(trh); table.appendChild(thead);
+          const tbody = document.createElement('tbody');
+          list.forEach((e,i) => {
+            const tr = document.createElement('tr');
+            [i+1, e.name, e.score, e.wave, e.duration, e.date].forEach(val => { const td = document.createElement('td'); td.textContent = val; tr.appendChild(td); });
+            tbody.appendChild(tr);
+          });
+          table.appendChild(tbody);
+          tableDiv.appendChild(table);
+        }
+        renderTable();
+      }
+
+      function showGameOver(entry) {
+        const overlay = document.getElementById('overlay'); overlay.innerHTML = '';
+        const container = document.createElement('div'); container.className = 'modal';
+        const h2 = document.createElement('h2'); h2.textContent = 'Game Over'; container.appendChild(h2);
+        const p = document.createElement('p'); p.textContent = `Du hast ${entry.score} Punkte erreicht. Welle ${entry.wave}.`; container.appendChild(p);
+        const again = document.createElement('button'); again.className = 'btn'; again.textContent = 'Nochmal spielen'; again.onclick = startGame; container.appendChild(again);
+        const share = document.createElement('button'); share.className = 'btn'; share.textContent = 'Teilen'; share.onclick = () => showShareMenu(entry); container.appendChild(share);
+        const menuBtn = document.createElement('button'); menuBtn.className = 'btn'; menuBtn.textContent = 'Menü'; menuBtn.onclick = showMainMenu; container.appendChild(menuBtn);
+        overlay.appendChild(container);
+        overlay.style.display = 'flex';
+      }
+
+      function showShareMenu(entry) {
+        const overlay = document.getElementById('overlay'); overlay.innerHTML = '';
+        const container = document.createElement('div'); container.className = 'modal';
+        const h2 = document.createElement('h2'); h2.textContent = 'Teilen'; container.appendChild(h2);
+        const row1 = document.createElement('div');
+        const row2 = document.createElement('div');
+        function mk(label, fn) {
+          const b = document.createElement('button'); b.className = 'btn'; b.textContent = label; b.onclick = () => fn(entry); return b;
+        }
+        row1.appendChild(mk('X/Twitter', shareToTwitter));
+        row1.appendChild(mk('Facebook', shareToFacebook));
+        row1.appendChild(mk('LinkedIn', shareToLinkedIn));
+        row2.appendChild(mk('Mastodon', shareToMastodon));
+        row2.appendChild(mk('WhatsApp', shareToWhatsApp));
+        row2.appendChild(mk('Native', shareNative));
+        container.appendChild(row1);
+        container.appendChild(row2);
+        const copyBtn = document.createElement('button'); copyBtn.className = 'btn'; copyBtn.textContent = 'Link kopieren'; copyBtn.onclick = copyShareLink; container.appendChild(copyBtn);
+        const back = document.createElement('button'); back.className = 'btn'; back.textContent = 'Zurück'; back.onclick = () => showGameOver(entry); container.appendChild(back);
+        overlay.appendChild(container);
+      }
+
+      function startGame() {
+        const overlay = document.getElementById('overlay'); overlay.style.display = 'none';
+        restart();
+      }
+
+      showMainMenu();
+    })();
+  </script>
+</body>
+</html>
